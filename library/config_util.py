@@ -51,11 +51,15 @@ class BaseSubsetParams:
   image_dir: Optional[str] = None
   num_repeats: int = 1
   shuffle_caption: bool = False
+  caption_separator: str = ',',
   keep_tokens: int = 0
+  keep_tokens_separator: str = None,
   color_aug: bool = False
   flip_aug: bool = False
   face_crop_aug_range: Optional[Tuple[float, float]] = None
   random_crop: bool = False
+  caption_prefix: Optional[str] = None
+  caption_suffix: Optional[str] = None
   caption_dropout_rate: float = 0.0
   caption_dropout_every_n_epochs: int = 0
   caption_tag_dropout_rate: float = 0.0
@@ -157,8 +161,11 @@ class ConfigSanitizer:
     "random_crop": bool,
     "shuffle_caption": bool,
     "keep_tokens": int,
+    "keep_tokens_separator": str,
     "token_warmup_min": int,
     "token_warmup_step": Any(float,int),
+    "caption_prefix": str,
+    "caption_suffix": str,
   }
   # DO means DropOut
   DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -456,9 +463,12 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           num_repeats: {subset.num_repeats}
           shuffle_caption: {subset.shuffle_caption}
           keep_tokens: {subset.keep_tokens}
+          keep_tokens_separator: {subset.keep_tokens_separator}
           caption_dropout_rate: {subset.caption_dropout_rate}
           caption_dropout_every_n_epoches: {subset.caption_dropout_every_n_epochs}
           caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
+          caption_prefix: {subset.caption_prefix}
+          caption_suffix: {subset.caption_suffix}
           color_aug: {subset.color_aug}
           flip_aug: {subset.flip_aug}
           face_crop_aug_range: {subset.face_crop_aug_range}
@@ -541,17 +551,13 @@ def generate_controlnet_subsets_config_by_subdirs(train_data_dir: Optional[str] 
       return []
 
     subsets_config = []
-    for subdir in base_dir.iterdir():
-      if not subdir.is_dir():
-        continue
-
-      subset_config = {"image_dir": str(subdir), "conditioning_data_dir": conditioning_data_dir, "caption_extension": caption_extension, "num_repeats": 1}
-      subsets_config.append(subset_config)
+    subset_config = {"image_dir": train_data_dir, "conditioning_data_dir": conditioning_data_dir, "caption_extension": caption_extension, "num_repeats": 1}
+    subsets_config.append(subset_config)
 
     return subsets_config
 
   subsets_config = []
-  subsets_config += generate(train_data_dir, False)
+  subsets_config += generate(train_data_dir)
 
   return subsets_config
 
