@@ -3,6 +3,7 @@
 import argparse
 import ast
 import asyncio
+import datetime
 import importlib
 import json
 import pathlib
@@ -18,7 +19,7 @@ from typing import (
     Tuple,
     Union,
 )
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 import gc
 import glob
 import math
@@ -34,7 +35,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torchvision import transforms
-from transformers import CLIPTokenizer
+from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 import transformers
 from diffusers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 from diffusers import (
@@ -58,12 +59,11 @@ from huggingface_hub import hf_hub_download
 import numpy as np
 from PIL import Image
 import cv2
-from einops import rearrange
-from torch import einsum
 import safetensors.torch
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
+import library.sai_model_spec as sai_model_spec
 
 # from library.attention_processors import FlashAttnProcessor
 # from library.hypernetwork import replace_attentions_for_hypernetwork
@@ -94,6 +94,22 @@ try:
     import pillow_avif
 
     IMAGE_EXTENSIONS.extend([".avif", ".AVIF"])
+except:
+    pass
+
+# JPEG-XL on Linux
+try:
+    from jxlpy import JXLImagePlugin
+
+    IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
+except:
+    pass
+
+# JPEG-XL on Windows
+try:
+    import pillow_jxl
+
+    IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
 except:
     pass
 
@@ -133,6 +149,13 @@ class ImageInfo:
 
 class BucketManager:
     def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps) -> None:
+        if max_size is not None:
+            if max_reso is not None:
+                assert max_size >= max_reso[0], "the max_size should be larger than the width of max_reso"
+                assert max_size >= max_reso[1], "the max_size should be larger than the height of max_reso"
+            if min_size is not None:
+                assert max_size >= min_size, "the max_size should be larger than the min_size"
+
         self.no_upscale = no_upscale
         if max_reso is None:
             self.max_reso = None
@@ -326,7 +349,9 @@ class BaseSubset:
         image_dir: Optional[str],
         num_repeats: int,
         shuffle_caption: bool,
+        caption_separator: str,
         keep_tokens: int,
+        keep_tokens_separator: str,
         color_aug: bool,
         flip_aug: bool,
         face_crop_aug_range: Optional[Tuple[float, float]],
@@ -334,13 +359,17 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        caption_prefix: Optional[str],
+        caption_suffix: Optional[str],
         token_warmup_min: int,
         token_warmup_step: Union[float, int],
     ) -> None:
         self.image_dir = image_dir
         self.num_repeats = num_repeats
         self.shuffle_caption = shuffle_caption
+        self.caption_separator = caption_separator
         self.keep_tokens = keep_tokens
+        self.keep_tokens_separator = keep_tokens_separator
         self.color_aug = color_aug
         self.flip_aug = flip_aug
         self.face_crop_aug_range = face_crop_aug_range
@@ -348,6 +377,8 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        self.caption_prefix = caption_prefix
+        self.caption_suffix = caption_suffix
 
         self.token_warmup_min = token_warmup_min  # step=0におけるタグの数
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
@@ -364,7 +395,9 @@ class DreamBoothSubset(BaseSubset):
         caption_extension: str,
         num_repeats,
         shuffle_caption,
+        caption_separator: str,
         keep_tokens,
+        keep_tokens_separator,
         color_aug,
         flip_aug,
         face_crop_aug_range,
@@ -372,6 +405,8 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        caption_prefix,
+        caption_suffix,
         token_warmup_min,
         token_warmup_step,
     ) -> None:
@@ -381,7 +416,9 @@ class DreamBoothSubset(BaseSubset):
             image_dir,
             num_repeats,
             shuffle_caption,
+            caption_separator,
             keep_tokens,
+            keep_tokens_separator,
             color_aug,
             flip_aug,
             face_crop_aug_range,
@@ -389,6 +426,8 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            caption_prefix,
+            caption_suffix,
             token_warmup_min,
             token_warmup_step,
         )
@@ -412,7 +451,9 @@ class FineTuningSubset(BaseSubset):
         metadata_file: str,
         num_repeats,
         shuffle_caption,
+        caption_separator,
         keep_tokens,
+        keep_tokens_separator,
         color_aug,
         flip_aug,
         face_crop_aug_range,
@@ -420,6 +461,8 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        caption_prefix,
+        caption_suffix,
         token_warmup_min,
         token_warmup_step,
     ) -> None:
@@ -429,7 +472,9 @@ class FineTuningSubset(BaseSubset):
             image_dir,
             num_repeats,
             shuffle_caption,
+            caption_separator,
             keep_tokens,
+            keep_tokens_separator,
             color_aug,
             flip_aug,
             face_crop_aug_range,
@@ -437,6 +482,8 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            caption_prefix,
+            caption_suffix,
             token_warmup_min,
             token_warmup_step,
         )
@@ -457,7 +504,9 @@ class ControlNetSubset(BaseSubset):
         caption_extension: str,
         num_repeats,
         shuffle_caption,
+        caption_separator,
         keep_tokens,
+        keep_tokens_separator,
         color_aug,
         flip_aug,
         face_crop_aug_range,
@@ -465,6 +514,8 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        caption_prefix,
+        caption_suffix,
         token_warmup_min,
         token_warmup_step,
     ) -> None:
@@ -474,7 +525,9 @@ class ControlNetSubset(BaseSubset):
             image_dir,
             num_repeats,
             shuffle_caption,
+            caption_separator,
             keep_tokens,
+            keep_tokens_separator,
             color_aug,
             flip_aug,
             face_crop_aug_range,
@@ -482,6 +535,8 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            caption_prefix,
+            caption_suffix,
             token_warmup_min,
             token_warmup_step,
         )
@@ -589,6 +644,12 @@ class BaseDataset(torch.utils.data.Dataset):
         self.replacements[str_from] = str_to
 
     def process_caption(self, subset: BaseSubset, caption):
+        # caption に prefix/suffix を付ける
+        if subset.caption_prefix:
+            caption = subset.caption_prefix + " " + caption
+        if subset.caption_suffix:
+            caption = caption + " " + subset.caption_suffix
+
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
         is_drop_out = (
@@ -601,15 +662,29 @@ class BaseDataset(torch.utils.data.Dataset):
             caption = ""
         else:
             if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
-                tokens = [t.strip() for t in caption.strip().split(",")]
+                fixed_tokens = []
+                flex_tokens = []
+                if hasattr(subset, 'keep_tokens_separator') and subset.keep_tokens_separator in caption:
+                    fixed_part, flex_part = caption.split(subset.keep_tokens_separator, 1)
+                    fixed_tokens = [t.strip() for t in fixed_part.split(subset.caption_separator) if t.strip()]
+                    flex_tokens = [t.strip() for t in flex_part.split(subset.caption_separator) if t.strip()]
+                else:
+                    tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
+                    flex_tokens = tokens[:]
+                    if subset.keep_tokens > 0:
+                        fixed_tokens = flex_tokens[:subset.keep_tokens]
+                        flex_tokens = tokens[subset.keep_tokens:]
+
+
                 if subset.token_warmup_step < 1:  # 初回に上書きする
                     subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
                 if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
                     tokens_len = (
-                        math.floor((self.current_step) * ((len(tokens) - subset.token_warmup_min) / (subset.token_warmup_step)))
+                        math.floor((self.current_step) * ((len(flex_tokens) - subset.token_warmup_min) / (subset.token_warmup_step)))
                         + subset.token_warmup_min
                     )
-                    tokens = tokens[:tokens_len]
+                    flex_tokens = flex_tokens[:tokens_len]
+
 
                 def dropout_tags(tokens):
                     if subset.caption_tag_dropout_rate <= 0:
@@ -619,12 +694,6 @@ class BaseDataset(torch.utils.data.Dataset):
                         if random.random() >= subset.caption_tag_dropout_rate:
                             l.append(token)
                     return l
-
-                fixed_tokens = []
-                flex_tokens = tokens[:]
-                if subset.keep_tokens > 0:
-                    fixed_tokens = flex_tokens[: subset.keep_tokens]
-                    flex_tokens = tokens[subset.keep_tokens :]
 
                 if subset.shuffle_caption:
                     random.shuffle(flex_tokens)
@@ -800,6 +869,12 @@ class BaseDataset(torch.utils.data.Dataset):
 
         random.shuffle(self.buckets_indices)
         self.bucket_manager.shuffle()
+
+    def verify_bucket_reso_steps(self, min_steps: int):
+        assert self.bucket_reso_steps is None or self.bucket_reso_steps % min_steps == 0, (
+            f"bucket_reso_steps is {self.bucket_reso_steps}. it must be divisible by {min_steps}.\n"
+            + f"bucket_reso_stepsが{self.bucket_reso_steps}です。{min_steps}で割り切れる必要があります"
+        )
 
     def is_latent_cacheable(self):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
@@ -1664,6 +1739,7 @@ class ControlNetDataset(BaseDataset):
                 subset.num_repeats,
                 subset.shuffle_caption,
                 subset.keep_tokens,
+                subset.keep_tokens_separator,
                 subset.color_aug,
                 subset.flip_aug,
                 subset.face_crop_aug_range,
@@ -1671,6 +1747,8 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.caption_prefix,
+                subset.caption_suffix,
                 subset.token_warmup_min,
                 subset.token_warmup_step,
             )
@@ -1738,6 +1816,9 @@ class ControlNetDataset(BaseDataset):
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
         self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
 
+    def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True):
+        return self.dreambooth_dataset_delegate.cache_latents(vae, vae_batch_size, cache_to_disk, is_main_process)
+
     def __len__(self):
         return self.dreambooth_dataset_delegate.__len__()
 
@@ -1762,17 +1843,26 @@ class ControlNetDataset(BaseDataset):
             cond_img = load_image(image_info.cond_img_path)
 
             if self.dreambooth_dataset_delegate.enable_bucket:
-                cond_img = cv2.resize(cond_img, image_info.resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
                 assert (
                     cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
                 ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
-                ct, cl = crop_top_left
+                cond_img = cv2.resize(cond_img, image_info.resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
+
+                # TODO support random crop
+                # 現在サポートしているcropはrandomではなく中央のみ
                 h, w = target_size_hw
+                ct = (cond_img.shape[0] - h) // 2
+                cl = (cond_img.shape[1] - w) // 2
                 cond_img = cond_img[ct : ct + h, cl : cl + w]
             else:
-                assert (
-                    cond_img.shape[0] == self.height and cond_img.shape[1] == self.width
-                ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
+                # assert (
+                #     cond_img.shape[0] == self.height and cond_img.shape[1] == self.width
+                # ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
+                # resize to target
+                if cond_img.shape[0] != target_size_hw[0] or cond_img.shape[1] != target_size_hw[1]:
+                    cond_img = cv2.resize(
+                        cond_img, (int(target_size_hw[1]), int(target_size_hw[0])), interpolation=cv2.INTER_LANCZOS4
+                    )
 
             if flipped:
                 cond_img = cond_img[:, ::-1, :].copy()  # copy to avoid negative stride
@@ -1831,6 +1921,10 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_caching_mode(self, caching_mode):
         for dataset in self.datasets:
             dataset.set_caching_mode(caching_mode)
+
+    def verify_bucket_reso_steps(self, min_steps: int):
+        for dataset in self.datasets:
+            dataset.verify_bucket_reso_steps(min_steps)
 
     def is_latent_cacheable(self) -> bool:
         return all([dataset.is_latent_cacheable() for dataset in self.datasets])
@@ -1955,7 +2049,7 @@ def debug_dataset(train_dataset, show_input_ids=False):
                     if "conditioning_images" in example:
                         cond_img = example["conditioning_images"][j]
                         print(f"conditioning image size: {cond_img.size()}")
-                        cond_img = (cond_img.numpy() * 255.0).astype(np.uint8)
+                        cond_img = ((cond_img.numpy() + 1.0) * 127.5).astype(np.uint8)
                         cond_img = np.transpose(cond_img, (1, 2, 0))
                         cond_img = cond_img[:, :, ::-1]
                         if os.name == "nt":
@@ -2020,6 +2114,9 @@ class MinimalDataset(BaseDataset):
         self.bucket_info = {}
         self.is_reg = False
         self.image_dir = "dummy"  # for metadata
+
+    def verify_bucket_reso_steps(self, min_steps: int):
+        pass
 
     def is_latent_cacheable(self) -> bool:
         return False
@@ -2164,6 +2261,7 @@ def cache_batch_latents(
             if flip_aug:
                 info.latents_flipped = flipped_latent
 
+    # FIXME this slows down caching a lot, specify this as an option
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -2459,6 +2557,106 @@ def replace_vae_attn_to_memory_efficient():
 # region arguments
 
 
+def load_metadata_from_safetensors(safetensors_file: str) -> dict:
+    """r
+    This method locks the file. see https://github.com/huggingface/safetensors/issues/164
+    If the file isn't .safetensors or doesn't have metadata, return empty dict.
+    """
+    if os.path.splitext(safetensors_file)[1] != ".safetensors":
+        return {}
+
+    with safetensors.safe_open(safetensors_file, framework="pt", device="cpu") as f:
+        metadata = f.metadata()
+    if metadata is None:
+        metadata = {}
+    return metadata
+
+
+# this metadata is referred from train_network and various scripts, so we wrote here
+SS_METADATA_KEY_V2 = "ss_v2"
+SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
+SS_METADATA_KEY_NETWORK_MODULE = "ss_network_module"
+SS_METADATA_KEY_NETWORK_DIM = "ss_network_dim"
+SS_METADATA_KEY_NETWORK_ALPHA = "ss_network_alpha"
+SS_METADATA_KEY_NETWORK_ARGS = "ss_network_args"
+
+SS_METADATA_MINIMUM_KEYS = [
+    SS_METADATA_KEY_V2,
+    SS_METADATA_KEY_BASE_MODEL_VERSION,
+    SS_METADATA_KEY_NETWORK_MODULE,
+    SS_METADATA_KEY_NETWORK_DIM,
+    SS_METADATA_KEY_NETWORK_ALPHA,
+    SS_METADATA_KEY_NETWORK_ARGS,
+]
+
+
+def build_minimum_network_metadata(
+    v2: Optional[bool],
+    base_model: Optional[str],
+    network_module: str,
+    network_dim: str,
+    network_alpha: str,
+    network_args: Optional[dict],
+):
+    # old LoRA doesn't have base_model
+    metadata = {
+        SS_METADATA_KEY_NETWORK_MODULE: network_module,
+        SS_METADATA_KEY_NETWORK_DIM: network_dim,
+        SS_METADATA_KEY_NETWORK_ALPHA: network_alpha,
+    }
+    if v2 is not None:
+        metadata[SS_METADATA_KEY_V2] = v2
+    if base_model is not None:
+        metadata[SS_METADATA_KEY_BASE_MODEL_VERSION] = base_model
+    if network_args is not None:
+        metadata[SS_METADATA_KEY_NETWORK_ARGS] = json.dumps(network_args)
+    return metadata
+
+
+def get_sai_model_spec(
+    state_dict: dict,
+    args: argparse.Namespace,
+    sdxl: bool,
+    lora: bool,
+    textual_inversion: bool,
+    is_stable_diffusion_ckpt: Optional[bool] = None,  # None for TI and LoRA
+):
+    timestamp = time.time()
+
+    v2 = args.v2
+    v_parameterization = args.v_parameterization
+    reso = args.resolution
+
+    title = args.metadata_title if args.metadata_title is not None else args.output_name
+
+    if args.min_timestep is not None or args.max_timestep is not None:
+        min_time_step = args.min_timestep if args.min_timestep is not None else 0
+        max_time_step = args.max_timestep if args.max_timestep is not None else 1000
+        timesteps = (min_time_step, max_time_step)
+    else:
+        timesteps = None
+
+    metadata = sai_model_spec.build_metadata(
+        state_dict,
+        v2,
+        v_parameterization,
+        sdxl,
+        lora,
+        textual_inversion,
+        timestamp,
+        title=title,
+        reso=reso,
+        is_stable_diffusion_ckpt=is_stable_diffusion_ckpt,
+        author=args.metadata_author,
+        description=args.metadata_description,
+        license=args.metadata_license,
+        tags=args.metadata_tags,
+        timesteps=timesteps,
+        clip_skip=args.clip_skip,  # None or int
+    )
+    return metadata
+
+
 def add_sd_models_arguments(parser: argparse.ArgumentParser):
     # for pretrained models
     parser.add_argument("--v2", action="store_true", help="load Stable Diffusion v2.0 model / Stable Diffusion 2.0のモデルを読み込む")
@@ -2484,7 +2682,7 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW8bit, Lion8bit, PagedLion8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, AdaFactor",
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, AdaFactor",
     )
 
     # backward compatibility
@@ -2691,6 +2889,12 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
     )  # TODO move to SDXL training, because it is not supported by SD1/2
     parser.add_argument(
+        "--ddp_timeout",
+        type=int,
+        default=None,
+        help="DDP timeout (min, None for default of accelerate) / DDPのタイムアウト（分、Noneでaccelerateのデフォルト）",
+    )
+    parser.add_argument(
         "--clip_skip",
         type=int,
         default=None,
@@ -2739,6 +2943,13 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         type=int,
         default=None,
         help="enable multires noise with this number of iterations (if enabled, around 6-10 is recommended) / Multires noiseを有効にしてこのイテレーション数を設定する（有効にする場合は6-10程度を推奨）",
+    )
+    parser.add_argument(
+        "--ip_noise_gamma",
+        type=float,
+        default=None,
+        help="enable input perturbation noise. used for regularization. recommended value: around 0.1 (from arxiv.org/abs/2301.11706) "
+        + "/  input perturbation noiseを有効にする。正則化に使用される。推奨値: 0.1程度 (arxiv.org/abs/2301.11706 より)",
     )
     # parser.add_argument(
     #     "--perlin_noise",
@@ -2829,6 +3040,38 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--output_config", action="store_true", help="output command line args to given .toml file / 引数を.tomlファイルに出力する"
     )
 
+    # SAI Model spec
+    parser.add_argument(
+        "--metadata_title",
+        type=str,
+        default=None,
+        help="title for model metadata (default is output_name) / メタデータに書き込まれるモデルタイトル、省略時はoutput_name",
+    )
+    parser.add_argument(
+        "--metadata_author",
+        type=str,
+        default=None,
+        help="author name for model metadata / メタデータに書き込まれるモデル作者名",
+    )
+    parser.add_argument(
+        "--metadata_description",
+        type=str,
+        default=None,
+        help="description for model metadata / メタデータに書き込まれるモデル説明",
+    )
+    parser.add_argument(
+        "--metadata_license",
+        type=str,
+        default=None,
+        help="license for model metadata / メタデータに書き込まれるモデルライセンス",
+    )
+    parser.add_argument(
+        "--metadata_tags",
+        type=str,
+        default=None,
+        help="tags for model metadata, separated by comma / メタデータに書き込まれるモデルタグ、カンマ区切り",
+    )
+
     if support_dreambooth:
         # DreamBooth training
         parser.add_argument(
@@ -2849,11 +3092,11 @@ def verify_training_args(args: argparse.Namespace):
         )
 
     # noise_offset, perlin_noise, multires_noise_iterations cannot be enabled at the same time
-    # Listを使って数えてもいいけど並べてしまえ
-    if args.noise_offset is not None and args.multires_noise_iterations is not None:
-        raise ValueError(
-            "noise_offset and multires_noise_iterations cannot be enabled at the same time / noise_offsetとmultires_noise_iterationsを同時に有効にできません"
-        )
+    # # Listを使って数えてもいいけど並べてしまえ
+    # if args.noise_offset is not None and args.multires_noise_iterations is not None:
+    #     raise ValueError(
+    #         "noise_offset and multires_noise_iterations cannot be enabled at the same time / noise_offsetとmultires_noise_iterationsを同時に有効にできません"
+    #     )
     # if args.noise_offset is not None and args.perlin_noise is not None:
     #     raise ValueError("noise_offset and perlin_noise cannot be enabled at the same time / noise_offsetとperlin_noiseは同時に有効にできません")
     # if args.perlin_noise is not None and args.multires_noise_iterations is not None:
@@ -2868,7 +3111,7 @@ def verify_training_args(args: argparse.Namespace):
         raise ValueError(
             "scale_v_pred_loss_like_noise_pred can be enabled only with v_parameterization / scale_v_pred_loss_like_noise_predはv_parameterizationが有効なときのみ有効にできます"
         )
-    
+
     if args.v_pred_like_loss and args.v_parameterization:
         raise ValueError(
             "v_pred_like_loss cannot be enabled with v_parameterization / v_pred_like_lossはv_parameterizationが有効なときには有効にできません"
@@ -2887,7 +3130,10 @@ def add_dataset_arguments(
     # dataset common
     parser.add_argument("--train_data_dir", type=str, default=None, help="directory for train images / 学習画像データのディレクトリ")
     parser.add_argument(
-        "--shuffle_caption", action="store_true", help="shuffle comma-separated caption / コンマで区切られたcaptionの各要素をshuffleする"
+        "--shuffle_caption", action="store_true", help="shuffle separated caption / 区切られたcaptionの各要素をshuffleする"
+    )
+    parser.add_argument(
+        "--caption_separator", type=str, default=",", help="separator for caption / captionの区切り文字"
     )
     parser.add_argument(
         "--caption_extension", type=str, default=".caption", help="extension of caption files / 読み込むcaptionファイルの拡張子"
@@ -2903,6 +3149,24 @@ def add_dataset_arguments(
         type=int,
         default=0,
         help="keep heading N tokens when shuffling caption tokens (token means comma separated strings) / captionのシャッフル時に、先頭からこの個数のトークンをシャッフルしないで残す（トークンはカンマ区切りの各部分を意味する）",
+    )
+    parser.add_argument(
+        "--keep_tokens_separator",
+        type=str,
+        default="",
+        help="A custom separator to divide the caption into fixed and flexible parts. Tokens before this separator will not be shuffled. If not specified, '--keep_tokens' will be used to determine the fixed number of tokens.",
+    )
+    parser.add_argument(
+        "--caption_prefix",
+        type=str,
+        default=None,
+        help="prefix for caption text / captionのテキストの先頭に付ける文字列",
+    )
+    parser.add_argument(
+        "--caption_suffix",
+        type=str,
+        default=None,
+        help="suffix for caption text / captionのテキストの末尾に付ける文字列",
     )
     parser.add_argument("--color_aug", action="store_true", help="enable weak color augmentation / 学習時に色合いのaugmentationを有効にする")
     parser.add_argument("--flip_aug", action="store_true", help="enable horizontal flip augmentation / 学習時に左右反転のaugmentationを有効にする")
@@ -3143,7 +3407,7 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
 
 
 def get_optimizer(args, trainable_params):
-    # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW8bit, Lion8bit, PagedLion8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
+    # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
 
     optimizer_type = args.optimizer_type
     if args.use_8bit_adam:
@@ -3245,6 +3509,20 @@ def get_optimizer(args, trainable_params):
                     "No PagedLion8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedLion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
                 )
 
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "PagedAdamW32bit".lower():
+        print(f"use 32-bit PagedAdamW optimizer | {optimizer_kwargs}")
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
+        try:
+            optimizer_class = bnb.optim.PagedAdamW32bit
+        except AttributeError:
+            raise AttributeError(
+                "No PagedAdamW32bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedAdamW32bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
+            )
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "SGDNesterov".lower():
@@ -3565,11 +3843,15 @@ def prepare_accelerator(args: argparse.Namespace):
             if args.wandb_api_key is not None:
                 wandb.login(key=args.wandb_api_key)
 
+    kwargs_handlers = (
+        None if args.ddp_timeout is None else [InitProcessGroupKwargs(timeout=datetime.timedelta(minutes=args.ddp_timeout))]
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=log_with,
         project_dir=logging_dir,
+        kwargs_handlers=kwargs_handlers,
     )
     return accelerator
 
@@ -3594,7 +3876,7 @@ def prepare_dtype(args: argparse.Namespace):
 
 def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu", unet_use_linear_projection_in_v2=False):
     name_or_path = args.pretrained_model_name_or_path
-    name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
+    name_or_path = os.path.realpath(name_or_path) if os.path.islink(name_or_path) else name_or_path
     load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
     if load_stable_diffusion_format:
         print(f"load StableDiffusion checkpoint: {name_or_path}")
@@ -3733,8 +4015,58 @@ def get_hidden_states(args: argparse.Namespace, input_ids, tokenizer, text_encod
     return encoder_hidden_states
 
 
+def pool_workaround(
+    text_encoder: CLIPTextModelWithProjection, last_hidden_state: torch.Tensor, input_ids: torch.Tensor, eos_token_id: int
+):
+    r"""
+    workaround for CLIP's pooling bug: it returns the hidden states for the max token id as the pooled output
+    instead of the hidden states for the EOS token
+    If we use Textual Inversion, we need to use the hidden states for the EOS token as the pooled output
+
+    Original code from CLIP's pooling function:
+
+    \# text_embeds.shape = [batch_size, sequence_length, transformer.width]
+    \# take features from the eot embedding (eot_token is the highest number in each sequence)
+    \# casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+    pooled_output = last_hidden_state[
+        torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+        input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+    ]
+    """
+
+    # input_ids: b*n,77
+    # find index for EOS token
+
+    # Following code is not working if one of the input_ids has multiple EOS tokens (very odd case)
+    # eos_token_index = torch.where(input_ids == eos_token_id)[1]
+    # eos_token_index = eos_token_index.to(device=last_hidden_state.device)
+
+    # Create a mask where the EOS tokens are
+    eos_token_mask = (input_ids == eos_token_id).int()
+
+    # Use argmax to find the last index of the EOS token for each element in the batch
+    eos_token_index = torch.argmax(eos_token_mask, dim=1)  # this will be 0 if there is no EOS token, it's fine
+    eos_token_index = eos_token_index.to(device=last_hidden_state.device)
+
+    # get hidden states for EOS token
+    pooled_output = last_hidden_state[torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device), eos_token_index]
+
+    # apply projection: projection may be of different dtype than last_hidden_state
+    pooled_output = text_encoder.text_projection(pooled_output.to(text_encoder.text_projection.weight.dtype))
+    pooled_output = pooled_output.to(last_hidden_state.dtype)
+
+    return pooled_output
+
+
 def get_hidden_states_sdxl(
-    max_token_length, input_ids1, input_ids2, tokenizer1, tokenizer2, text_encoder1, text_encoder2, weight_dtype=None
+    max_token_length: int,
+    input_ids1: torch.Tensor,
+    input_ids2: torch.Tensor,
+    tokenizer1: CLIPTokenizer,
+    tokenizer2: CLIPTokenizer,
+    text_encoder1: CLIPTextModel,
+    text_encoder2: CLIPTextModelWithProjection,
+    weight_dtype: Optional[str] = None,
 ):
     # input_ids: b,n,77 -> b*n, 77
     b_size = input_ids1.size()[0]
@@ -3748,7 +4080,9 @@ def get_hidden_states_sdxl(
     # text_encoder2
     enc_out = text_encoder2(input_ids2, output_hidden_states=True, return_dict=True)
     hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
-    pool2 = enc_out["text_embeds"]
+
+    # pool2 = enc_out["text_embeds"]
+    pool2 = pool_workaround(text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
 
     # b*n, 77, 768 or 1280 -> b, n*77, 768 or 1280
     n_size = 1 if max_token_length is None else max_token_length // 75
@@ -3849,8 +4183,9 @@ def save_sd_model_on_epoch_end_or_stepwise(
     vae,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
+        sai_metadata = get_sai_model_spec(None, args, False, False, False, is_stable_diffusion_ckpt=True)
         model_util.save_stable_diffusion_checkpoint(
-            args.v2, ckpt_file, text_encoder, unet, src_path, epoch_no, global_step, save_dtype, vae
+            args.v2, ckpt_file, text_encoder, unet, src_path, epoch_no, global_step, sai_metadata, save_dtype, vae
         )
 
     def diffusers_saver(out_dir):
@@ -4030,8 +4365,9 @@ def save_sd_model_on_train_end(
     vae,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
+        sai_metadata = get_sai_model_spec(None, args, False, False, False, is_stable_diffusion_ckpt=True)
         model_util.save_stable_diffusion_checkpoint(
-            args.v2, ckpt_file, text_encoder, unet, src_path, epoch_no, global_step, save_dtype, vae
+            args.v2, ckpt_file, text_encoder, unet, src_path, epoch_no, global_step, sai_metadata, save_dtype, vae
         )
 
     def diffusers_saver(out_dir):
@@ -4082,7 +4418,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
         noise = custom_train_functions.apply_noise_offset(latents, noise, args.noise_offset, args.adaptive_noise_scale)
-    elif args.multires_noise_iterations:
+    if args.multires_noise_iterations:
         noise = custom_train_functions.pyramid_noise_like(
             noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
         )
@@ -4097,9 +4433,35 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
-    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+    if args.ip_noise_gamma:
+        noisy_latents = noise_scheduler.add_noise(latents, noise + args.ip_noise_gamma * torch.randn_like(latents), timesteps)
+    else:
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     return noise, noisy_latents, timesteps
+
+
+def append_lr_to_logs(logs, lr_scheduler, optimizer_type, including_unet=True):
+    names = []
+    if including_unet:
+        names.append("unet")
+    names.append("text_encoder1")
+    names.append("text_encoder2")
+
+    append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
+
+
+def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
+    lrs = lr_scheduler.get_last_lr()
+
+    for lr_index in range(len(lrs)):
+        name = names[lr_index]
+        logs["lr/" + name] = float(lrs[lr_index])
+
+        if optimizer_type.lower().startswith("DAdapt".lower()) or optimizer_type.lower() == "Prodigy".lower():
+            logs["lr/d*lr/" + name] = (
+                lr_scheduler.optimizers[-1].param_groups[lr_index]["d"] * lr_scheduler.optimizers[-1].param_groups[lr_index]["lr"]
+            )
 
 
 # scheduler:
@@ -4394,7 +4756,7 @@ class ImageLoadingDataset(torch.utils.data.Dataset):
 
 
 # collate_fn用 epoch,stepはmultiprocessing.Value
-class collater_class:
+class collator_class:
     def __init__(self, epoch, step, dataset):
         self.current_epoch = epoch
         self.current_step = step
@@ -4412,3 +4774,21 @@ class collater_class:
         dataset.set_current_epoch(self.current_epoch.value)
         dataset.set_current_step(self.current_step.value)
         return examples[0]
+
+
+class LossRecorder:
+    def __init__(self):
+        self.loss_list: List[float] = []
+        self.loss_total: float = 0.0
+
+    def add(self, *, epoch: int, step: int, loss: float) -> None:
+        if epoch == 0:
+            self.loss_list.append(loss)
+        else:
+            self.loss_total -= self.loss_list[step]
+            self.loss_list[step] = loss
+        self.loss_total += loss
+
+    @property
+    def moving_average(self) -> float:
+        return self.loss_total / len(self.loss_list)
